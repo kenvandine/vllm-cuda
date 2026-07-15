@@ -13,11 +13,23 @@ name: build-release
 # One asset is published per architecture -- names match
 # VLLMServer::get_install_params() in lemonade:
 #   vllm-server-<tag>-linux-x64-cuda-<sm_target>.tar.gz
+#   vllm-server-<tag>-linux-arm64-cuda-<sm_target>.tar.gz
+#
+# sm_121 (NVIDIA GB10 / Jetson Thor) is ARM64-only: those are Grace-CPU-paired
+# SoC/superchip modules, not discrete GPUs that plug into an x86_64 host, so
+# there is no linux-x64-cuda-sm_121 asset -- it's built by build-arm64 on a
+# GitHub-hosted ARM64 runner against the aarch64 vllm/torch wheels (confirmed
+# on PyPI/download.pytorch.org: torch ships manylinux_2_28_aarch64 cu128
+# wheels with native sm_80/90/100/120 cubins + compute_120 PTX, same
+# PTX-fallback situation for sm_121 as the x86_64 build has -- see README).
 #
 # STATUS: prototype. Not yet validated end-to-end on real NVIDIA hardware.
 #
 # TODO(windows-cuda): add a windows-x64 matrix leg once a Windows nvprune/
 # cuobjdump install path (choco/direct .exe download, no apt) is worked out.
+# TODO(arm64-more-targets): sm_90/sm_100 also exist on ARM64 (GH200/GB200
+# Grace-Hopper/Grace-Blackwell), currently out of scope -- only sm_121 was
+# requested. Add them to DEFAULT_SM_TARGETS_ARM64 if/when needed.
 
 on:
   schedule:
@@ -33,7 +45,11 @@ on:
         type: boolean
         default: false
       sm_targets:
-        description: 'Comma-separated sm_XX targets to build (empty = all)'
+        description: 'Comma-separated linux-x64 sm_XX targets to build (empty = all)'
+        required: false
+        default: ''
+      sm_targets_arm64:
+        description: 'Comma-separated linux-arm64 sm_XX targets to build (empty = all)'
         required: false
         default: ''
       cuda_toolkit_version:
@@ -45,11 +61,16 @@ permissions:
   contents: write
 
 env:
-  # torch's fat wheel (verified against 2.11.0+cu128) ships native cubins for
-  # these, plus compute_120 PTX. sm_89/sm_121 have no native cubin yet, so
-  # they're pruned from the nearest same-generation PTX instead (JIT at
-  # first launch) -- see README's target matrix for the full rationale.
-  DEFAULT_SM_TARGETS: "sm_75,sm_80,sm_86,sm_89,sm_90,sm_100,sm_120,sm_121"
+  # torch's x86_64 fat wheel (verified against 2.11.0+cu128) ships native
+  # cubins for these, plus compute_120 PTX. sm_89 has no native cubin yet, so
+  # it's pruned from sm_86's PTX instead (JIT at first launch) -- see
+  # README's target matrix for the full rationale. sm_121 is ARM64-only (see
+  # header comment) so it is NOT in this list.
+  DEFAULT_SM_TARGETS: "sm_75,sm_80,sm_86,sm_89,sm_90,sm_100,sm_120"
+  # torch's aarch64 fat wheel (verified against 2.11.0+cu128) ships native
+  # cubins for sm_80/90/100/120, no native sm_121 cubin -- pruned from
+  # sm_120's PTX instead, same JIT-fallback situation as sm_89 above.
+  DEFAULT_SM_TARGETS_ARM64: "sm_121"
 
 jobs:
   check:
@@ -59,6 +80,7 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       need_build: ${{ steps.resolve.outputs.need_build }}
       sm_targets: ${{ steps.resolve.outputs.sm_targets }}
+      sm_targets_arm64: ${{ steps.resolve.outputs.sm_targets_arm64 }}
     steps:
       - name: Resolve version, tag, and target matrix
         id: resolve
@@ -84,15 +106,20 @@ jobs:
 
           TARGETS="${{ github.event.inputs.sm_targets }}"
           [ -n "$TARGETS" ] || TARGETS="$DEFAULT_SM_TARGETS"
-          # Emit as a JSON array for the build job's matrix.
           JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1].split(',')))" "$TARGETS")
           echo "sm_targets=$JSON" >> "$GITHUB_OUTPUT"
 
-          echo "Resolved vllm $VERSION -> tag $TAG (need_build=$NEED, targets=$TARGETS)"
+          TARGETS_ARM64="${{ github.event.inputs.sm_targets_arm64 }}"
+          [ -n "$TARGETS_ARM64" ] || TARGETS_ARM64="$DEFAULT_SM_TARGETS_ARM64"
+          JSON_ARM64=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1].split(',')))" "$TARGETS_ARM64")
+          echo "sm_targets_arm64=$JSON_ARM64" >> "$GITHUB_OUTPUT"
 
-  build:
+          echo "Resolved vllm $VERSION -> tag $TAG (need_build=$NEED, x64 targets=$TARGETS, arm64 targets=$TARGETS_ARM64)"
+
+  # x86_64 targets: discrete NVIDIA GPUs in a standard PC/server.
+  build-x64:
     needs: check
-    if: needs.check.outputs.need_build == 'true'
+    if: needs.check.outputs.need_build == 'true' && fromJson(needs.check.outputs.sm_targets)[0] != ''
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -103,126 +130,54 @@ jobs:
       TAG: ${{ needs.check.outputs.tag }}
       SM_TARGET: ${{ matrix.sm_target }}
       CUDA_TOOLKIT_VERSION: ${{ github.event.inputs.cuda_toolkit_version || '12-8' }}
+      ASSET_PLATFORM: linux-x64
+      NVIDIA_APT_ARCH: x86_64
+      PBS_TRIPLE: x86_64-unknown-linux-gnu
+      PBS_PY: 3.12.13
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-vllm-cuda
+        with:
+          version: ${{ env.VERSION }}
+          tag: ${{ env.TAG }}
+          sm_target: ${{ env.SM_TARGET }}
+          asset_platform: ${{ env.ASSET_PLATFORM }}
+          nvidia_apt_arch: ${{ env.NVIDIA_APT_ARCH }}
+          pbs_triple: ${{ env.PBS_TRIPLE }}
+          pbs_py: ${{ env.PBS_PY }}
+          cuda_toolkit_version: ${{ env.CUDA_TOOLKIT_VERSION }}
 
-      - name: Install nvprune + cuobjdump (standalone apt packages, not the full CUDA Toolkit)
-        run: |
-          set -euo pipefail
-          curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb
-          sudo dpkg -i /tmp/cuda-keyring.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            "cuda-nvprune-${CUDA_TOOLKIT_VERSION}" \
-            "cuda-cuobjdump-${CUDA_TOOLKIT_VERSION}"
-          echo "/usr/local/cuda-${CUDA_TOOLKIT_VERSION//-/.}/bin" >> "$GITHUB_PATH"
-
-      - name: Download portable Python (python-build-standalone)
-        run: |
-          set -euo pipefail
-          # vllm's official wheel is cp38-abi3 (works with any CPython >= 3.8),
-          # so there's no channel-driven Python version split like vllm-rocm
-          # needs -- pick one modern relocatable interpreter.
-          PBS_TAG=20260623
-          PBS_PY=3.12.9
-          PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-${PBS_PY}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
-          ROOT="$RUNNER_TEMP/vllm-build/vllm"
-          mkdir -p "$RUNNER_TEMP/vllm-build"
-          curl -fsSL "$PBS_URL" | tar -xz -C "$RUNNER_TEMP/vllm-build"
-          mv "$RUNNER_TEMP/vllm-build/python" "$ROOT"
-          "$ROOT/bin/python3" --version
-          echo "VLLM_ROOT=$ROOT" >> "$GITHUB_ENV"
-
-      - name: Install vLLM + PyTorch from official PyPI (fat, all architectures)
-        run: |
-          set -euo pipefail
-          "$VLLM_ROOT/bin/python3" -m pip install --upgrade pip
-          # Plain PyPI install -- no --index-url/--extra-index-url override.
-          # PyPI's default linux wheel for torch is already CUDA-enabled and
-          # is what vllm's own dependency metadata pins, so this is the
-          # simplest correct install (see README).
-          "$VLLM_ROOT/bin/pip" install "vllm==${VERSION}"
-          "$VLLM_ROOT/bin/python3" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
-
-      - name: Determine PTX fallback for this target (sm_89 -> sm_86, sm_121 -> sm_120)
-        id: fallback
-        run: |
-          set -euo pipefail
-          case "$SM_TARGET" in
-            sm_89)  echo "ptx_fallback=sm_86"  >> "$GITHUB_OUTPUT" ;;
-            sm_121) echo "ptx_fallback=sm_120" >> "$GITHUB_OUTPUT" ;;
-            *)      echo "ptx_fallback="        >> "$GITHUB_OUTPUT" ;;
-          esac
-
-      - name: Prune fat binaries down to ${{ matrix.sm_target }}
-        run: |
-          set -euo pipefail
-          SITE_PACKAGES="$VLLM_ROOT/lib/python3.12/site-packages"
-          chmod +x scripts/prune_cuda_arch.sh
-          ./scripts/prune_cuda_arch.sh "$SITE_PACKAGES" "$SM_TARGET" "${{ steps.fallback.outputs.ptx_fallback }}"
-
-      - name: Add vllm-server launcher shim
-        run: |
-          set -euo pipefail
-          cat > "$VLLM_ROOT/bin/vllm-server" << 'LAUNCHER_EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
-          LAUNCHER_EOF
-          chmod +x "$VLLM_ROOT/bin/vllm-server"
-          bash -n "$VLLM_ROOT/bin/vllm-server"
-
-      - name: Smoke test (--help)
-        run: |
-          set -euo pipefail
-          "$VLLM_ROOT/bin/vllm-server" --help >/dev/null
-
-      - name: Package asset (tar.gz, split if over GitHub's 2 GiB limit)
-        run: |
-          set -euo pipefail
-          BASE="vllm-server-${TAG}-linux-x64-cuda-${SM_TARGET}"
-          TARBALL="${BASE}.tar.gz"
-          tar -czf "${TARBALL}" -C "$(dirname "$VLLM_ROOT")" "$(basename "$VLLM_ROOT")"
-
-          LIMIT=$((1900 * 1024 * 1024))   # 1900 MiB, comfortably under 2 GiB
-          SIZE=$(wc -c < "${TARBALL}")
-          : > uploads.txt
-          if [ "${SIZE}" -gt "${LIMIT}" ]; then
-            split -b "${LIMIT}" -d -a 2 "${TARBALL}" "${BASE}.rawpart"
-            mapfile -t PARTS < <(ls "${BASE}".rawpart* | sort)
-            N=${#PARTS[@]}
-            NN=$(printf '%02d' "${N}")
-            i=1
-            for p in "${PARTS[@]}"; do
-              II=$(printf '%02d' "${i}")
-              mv "${p}" "${BASE}.part${II}-of-${NN}.tar.gz"
-              echo "${BASE}.part${II}-of-${NN}.tar.gz" >> uploads.txt
-              i=$((i + 1))
-            done
-            printf '%s\n' "${N}" > "${BASE}.partcount"
-            echo "${BASE}.partcount" >> uploads.txt
-            rm -f "${TARBALL}"
-            echo "Split ${TARBALL} (${SIZE} bytes) into ${N} parts"
-          else
-            echo "${TARBALL}" >> uploads.txt
-            echo "Single asset ${TARBALL} (${SIZE} bytes)"
-          fi
-          cat uploads.txt
-
-      - name: Publish to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release create "$TAG" \
-              --repo "${{ github.repository }}" \
-              --title "vllm-server $TAG" \
-              --notes "Self-contained vllm-server bundles (vllm ${VERSION}) for Lemonade's vllm CUDA backend, pruned per NVIDIA architecture with nvprune. Multi-GB bundles are split into .partNN-of-MM.tar.gz + .partcount." \
-              || true
-          fi
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber
-          done < uploads.txt
+  # ARM64 targets: Grace-CPU-paired NVIDIA SoC/superchip platforms
+  # (GB10 "DGX Spark" / Jetson Thor = sm_121; GH200/GB200 = sm_90/sm_100,
+  # not yet in scope -- see TODO(arm64-more-targets) above). These have no
+  # x86_64 counterpart, hence a separate job/runner rather than a matrix leg
+  # on build-x64.
+  build-arm64:
+    needs: check
+    if: needs.check.outputs.need_build == 'true' && fromJson(needs.check.outputs.sm_targets_arm64)[0] != ''
+    runs-on: ubuntu-22.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        sm_target: ${{ fromJson(needs.check.outputs.sm_targets_arm64) }}
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+      SM_TARGET: ${{ matrix.sm_target }}
+      CUDA_TOOLKIT_VERSION: ${{ github.event.inputs.cuda_toolkit_version || '12-8' }}
+      ASSET_PLATFORM: linux-arm64
+      NVIDIA_APT_ARCH: sbsa
+      PBS_TRIPLE: aarch64-unknown-linux-gnu
+      PBS_PY: 3.12.13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-vllm-cuda
+        with:
+          version: ${{ env.VERSION }}
+          tag: ${{ env.TAG }}
+          sm_target: ${{ env.SM_TARGET }}
+          asset_platform: ${{ env.ASSET_PLATFORM }}
+          nvidia_apt_arch: ${{ env.NVIDIA_APT_ARCH }}
+          pbs_triple: ${{ env.PBS_TRIPLE }}
+          pbs_py: ${{ env.PBS_PY }}
+          cuda_toolkit_version: ${{ env.CUDA_TOOLKIT_VERSION }}

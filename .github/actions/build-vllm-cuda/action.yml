@@ -1,0 +1,196 @@
+name: build-vllm-cuda
+description: >
+  Installs the official vllm/torch wheels for one host architecture, prunes
+  the fat multi-arch binaries down to a single target GPU architecture with
+  nvprune, packages the result, and publishes it as a release asset. Shared
+  by build-x64 and build-arm64 in build-release.yml -- see that file's header
+  comment and the README's target-matrix table for the full rationale.
+
+inputs:
+  version:
+    required: true
+    description: vllm version being built (e.g. 0.25.1)
+  tag:
+    required: true
+    description: release tag (e.g. vllm0.25.1)
+  sm_target:
+    required: true
+    description: target GPU architecture, e.g. sm_86 or sm_121
+  asset_platform:
+    required: true
+    description: asset platform component, e.g. linux-x64 or linux-arm64
+  nvidia_apt_arch:
+    required: true
+    description: NVIDIA apt repo architecture path segment (x86_64 or sbsa)
+  pbs_triple:
+    required: true
+    description: python-build-standalone target triple, e.g. x86_64-unknown-linux-gnu
+  pbs_py:
+    required: true
+    description: python-build-standalone CPython version, e.g. 3.12.13
+  cuda_toolkit_version:
+    required: true
+    description: CUDA toolkit package version suffix for nvprune/cuobjdump, e.g. 12-8
+
+runs:
+  using: composite
+  steps:
+    - name: Install nvprune + cuobjdump (standalone apt packages, not the full CUDA Toolkit)
+      shell: bash
+      env:
+        NVIDIA_APT_ARCH: ${{ inputs.nvidia_apt_arch }}
+        CUDA_TOOLKIT_VERSION: ${{ inputs.cuda_toolkit_version }}
+      run: |
+        set -euo pipefail
+        # ubuntu2204 + {x86_64,sbsa} are the two host-arch repo paths NVIDIA
+        # publishes standalone CUDA component packages under; sbsa is the
+        # ARM64 server path (used by GH200/GB200/Grace-paired boards, which
+        # is also what GitHub's ubuntu-22.04-arm runner needs here).
+        KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${NVIDIA_APT_ARCH}/cuda-keyring_1.1-1_all.deb"
+        curl -fsSL "$KEYRING_URL" -o /tmp/cuda-keyring.deb
+        sudo dpkg -i /tmp/cuda-keyring.deb
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          "cuda-nvprune-${CUDA_TOOLKIT_VERSION}" \
+          "cuda-cuobjdump-${CUDA_TOOLKIT_VERSION}"
+        echo "/usr/local/cuda-${CUDA_TOOLKIT_VERSION//-/.}/bin" >> "$GITHUB_PATH"
+
+    - name: Download portable Python (python-build-standalone)
+      shell: bash
+      env:
+        PBS_TRIPLE: ${{ inputs.pbs_triple }}
+        PBS_PY: ${{ inputs.pbs_py }}
+      run: |
+        set -euo pipefail
+        # vllm's official wheel is cp38-abi3 (works with any CPython >= 3.8),
+        # so there's no channel-driven Python version split like vllm-rocm
+        # needs -- pick one modern relocatable interpreter, per host arch.
+        PBS_TAG=20260623
+        PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-${PBS_PY}+${PBS_TAG}-${PBS_TRIPLE}-install_only.tar.gz"
+        ROOT="$RUNNER_TEMP/vllm-build/vllm"
+        mkdir -p "$RUNNER_TEMP/vllm-build"
+        curl -fsSL "$PBS_URL" | tar -xz -C "$RUNNER_TEMP/vllm-build"
+        mv "$RUNNER_TEMP/vllm-build/python" "$ROOT"
+        "$ROOT/bin/python3" --version
+        echo "VLLM_ROOT=$ROOT" >> "$GITHUB_ENV"
+        # Site-packages path embeds the MAJOR.MINOR of pbs_py (e.g. 3.12).
+        echo "PY_MAJOR_MINOR=$(echo "$PBS_PY" | cut -d. -f1,2)" >> "$GITHUB_ENV"
+
+    - name: Install vLLM + PyTorch from official PyPI (fat, all architectures)
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        "$VLLM_ROOT/bin/python3" -m pip install --upgrade pip
+        # Plain PyPI install -- no --index-url/--extra-index-url override.
+        # PyPI's default linux wheel for torch (both x86_64 and aarch64) is
+        # already CUDA-enabled and is what vllm's own dependency metadata
+        # pins, so this is the simplest correct install (see README). pip
+        # auto-selects the aarch64 wheel on an ARM64 interpreter.
+        "$VLLM_ROOT/bin/pip" install "vllm==${VERSION}"
+        "$VLLM_ROOT/bin/python3" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+    - name: Determine PTX fallback for this target
+      id: fallback
+      shell: bash
+      env:
+        SM_TARGET: ${{ inputs.sm_target }}
+      run: |
+        set -euo pipefail
+        # sm_89 (Ada, x86_64) and sm_121 (GB10/Thor, ARM64) have no native
+        # cubin in either fat wheel as of torch 2.11.0 -- fall back to the
+        # PTX of the nearest same-generation architecture that IS natively
+        # compiled (sm_86 and sm_120 respectively). See README target matrix.
+        case "$SM_TARGET" in
+          sm_89)  echo "ptx_fallback=sm_86"  >> "$GITHUB_OUTPUT" ;;
+          sm_121) echo "ptx_fallback=sm_120" >> "$GITHUB_OUTPUT" ;;
+          *)      echo "ptx_fallback="        >> "$GITHUB_OUTPUT" ;;
+        esac
+
+    - name: Prune fat binaries down to target architecture
+      shell: bash
+      env:
+        SM_TARGET: ${{ inputs.sm_target }}
+        PTX_FALLBACK: ${{ steps.fallback.outputs.ptx_fallback }}
+      run: |
+        set -euo pipefail
+        SITE_PACKAGES="$VLLM_ROOT/lib/python${PY_MAJOR_MINOR}/site-packages"
+        chmod +x "$GITHUB_ACTION_PATH/../../../scripts/prune_cuda_arch.sh"
+        "$GITHUB_ACTION_PATH/../../../scripts/prune_cuda_arch.sh" "$SITE_PACKAGES" "$SM_TARGET" "$PTX_FALLBACK"
+
+    - name: Add vllm-server launcher shim
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat > "$VLLM_ROOT/bin/vllm-server" << 'LAUNCHER_EOF'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
+        LAUNCHER_EOF
+        chmod +x "$VLLM_ROOT/bin/vllm-server"
+        bash -n "$VLLM_ROOT/bin/vllm-server"
+
+    - name: Smoke test (--help)
+      shell: bash
+      run: |
+        set -euo pipefail
+        "$VLLM_ROOT/bin/vllm-server" --help >/dev/null
+
+    - name: Package asset (tar.gz, split if over GitHub's 2 GiB limit)
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+        SM_TARGET: ${{ inputs.sm_target }}
+        ASSET_PLATFORM: ${{ inputs.asset_platform }}
+      run: |
+        set -euo pipefail
+        BASE="vllm-server-${TAG}-${ASSET_PLATFORM}-cuda-${SM_TARGET}"
+        TARBALL="${BASE}.tar.gz"
+        tar -czf "${TARBALL}" -C "$(dirname "$VLLM_ROOT")" "$(basename "$VLLM_ROOT")"
+
+        LIMIT=$((1900 * 1024 * 1024))   # 1900 MiB, comfortably under 2 GiB
+        SIZE=$(wc -c < "${TARBALL}")
+        : > uploads.txt
+        if [ "${SIZE}" -gt "${LIMIT}" ]; then
+          split -b "${LIMIT}" -d -a 2 "${TARBALL}" "${BASE}.rawpart"
+          mapfile -t PARTS < <(ls "${BASE}".rawpart* | sort)
+          N=${#PARTS[@]}
+          NN=$(printf '%02d' "${N}")
+          i=1
+          for p in "${PARTS[@]}"; do
+            II=$(printf '%02d' "${i}")
+            mv "${p}" "${BASE}.part${II}-of-${NN}.tar.gz"
+            echo "${BASE}.part${II}-of-${NN}.tar.gz" >> uploads.txt
+            i=$((i + 1))
+          done
+          printf '%s\n' "${N}" > "${BASE}.partcount"
+          echo "${BASE}.partcount" >> uploads.txt
+          rm -f "${TARBALL}"
+          echo "Split ${TARBALL} (${SIZE} bytes) into ${N} parts"
+        else
+          echo "${TARBALL}" >> uploads.txt
+          echo "Single asset ${TARBALL} (${SIZE} bytes)"
+        fi
+        cat uploads.txt
+
+    - name: Publish to release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ inputs.tag }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "vllm-server $TAG" \
+            --notes "Self-contained vllm-server bundles (vllm ${VERSION}) for Lemonade's vllm CUDA backend, pruned per NVIDIA architecture with nvprune. Multi-GB bundles are split into .partNN-of-MM.tar.gz + .partcount." \
+            || true
+        fi
+        while IFS= read -r f; do
+          [ -n "$f" ] || continue
+          gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber
+        done < uploads.txt

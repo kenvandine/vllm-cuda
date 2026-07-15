@@ -63,23 +63,32 @@ needed) instead of recompiling anything:
 
 ### Target matrix (mirrors `llamacpp`'s CUDA support list in Lemonade)
 
-| Target | Cubin source | Notes |
-|--------|-------------|-------|
-| `sm_75` (Turing) | native | RTX 20, GTX 16, T4 |
-| `sm_80` (Ampere DC) | native | A100 |
-| `sm_86` (Ampere) | native | RTX 30, A40, A6000 |
-| `sm_89` (Ada) | PTX JIT from `compute_86` | torch's fat wheel has no native `sm_89` cubin; forward-compat PTX JIT applies (same major generation as `sm_86`). First launch pays a JIT-compile cost that vLLM/torch then cache. |
-| `sm_90` (Hopper) | native | H100, H200 |
-| `sm_100` (Blackwell DC) | native | B100, B200 |
-| `sm_120` (Blackwell) | native | RTX 50 |
-| `sm_121` (GB10/Thor) | PTX JIT from `compute_120` | Same rationale as `sm_89`: no native cubin yet, PTX JIT within the Blackwell generation. |
+Verified directly against the actual PyPI/PyTorch wheels (downloaded and
+inspected with `cuobjdump`/`strings`), separately for each host architecture
+— they don't ship the same native cubins:
 
-`sm_89`/`sm_121` assets are therefore identical in content to their
-neighboring native-cubin build (`sm_86`/`sm_120` respectively) — they exist
-as separate release tags/filenames purely so Lemonade's
-`get_install_params()` can key off `SystemInfo::get_cuda_arch()` uniformly,
-matching the llama.cpp CUDA convention. This can be revisited once torch
-ships native cubins for those architectures.
+| Target | Host arch | Cubin source | Notes |
+|--------|-----------|-------------|-------|
+| `sm_75` (Turing) | x86_64 | native | RTX 20, GTX 16, T4 |
+| `sm_80` (Ampere DC) | x86_64 | native | A100 |
+| `sm_86` (Ampere) | x86_64 | native | RTX 30, A40, A6000 |
+| `sm_89` (Ada) | x86_64 | PTX JIT from `compute_86` | torch's x86_64 fat wheel has no native `sm_89` cubin; forward-compat PTX JIT applies (same major generation as `sm_86`). First launch pays a JIT-compile cost that vLLM/torch then cache. |
+| `sm_90` (Hopper) | x86_64 | native | H100, H200 |
+| `sm_100` (Blackwell DC) | x86_64 | native | B100, B200 |
+| `sm_120` (Blackwell) | x86_64 | native | RTX 50 |
+| `sm_121` (GB10/Thor) | **arm64** | PTX JIT from `compute_120` | GB10 ("DGX Spark") and Jetson Thor are Grace-CPU-paired SoC/superchip modules — ARM64 hosts, not discrete GPUs in an x86_64 PC. Built by a separate `build-arm64` job on a GitHub-hosted ARM64 runner (`ubuntu-22.04-arm`), against the `manylinux_2_28_aarch64` vllm/torch wheels. Verified torch's aarch64 fat wheel embeds native `sm_80/90/100/120` cubins (a different, narrower set than the x86_64 wheel) but **no native `sm_121` cubin**, so it falls back to `compute_120` PTX, same JIT-on-first-launch situation as `sm_89` above. |
+
+`sm_89` is therefore identical in content to `sm_86`'s pruned build, and
+`sm_121` is identical to `sm_120`'s (arm64) pruned build — they exist as
+separate release tags/filenames purely so Lemonade's `get_install_params()`
+can key off `SystemInfo::get_cuda_arch()` uniformly, matching the llama.cpp
+CUDA convention. This can be revisited once torch ships native cubins for
+those architectures.
+
+`sm_90`/`sm_100` (Hopper/Blackwell DC) also exist on ARM64 hosts (NVIDIA
+GH200/GB200 "Grace Hopper"/"Grace Blackwell" superchips) but are **not
+currently built** — only `sm_121` was requested. See the
+`TODO(arm64-more-targets)` note in the build workflow to add them.
 
 ## Releases
 
@@ -96,7 +105,7 @@ When a new `vllm` version appears, it builds and publishes a release tagged
 | Linux x64 | CUDA (`sm_90`) | `vllm-server-<tag>-linux-x64-cuda-sm_90.tar.gz` |
 | Linux x64 | CUDA (`sm_100`) | `vllm-server-<tag>-linux-x64-cuda-sm_100.tar.gz` |
 | Linux x64 | CUDA (`sm_120`) | `vllm-server-<tag>-linux-x64-cuda-sm_120.tar.gz` |
-| Linux x64 | CUDA (`sm_121`) | `vllm-server-<tag>-linux-x64-cuda-sm_121.tar.gz` |
+| **Linux arm64** | CUDA (`sm_121`) | `vllm-server-<tag>-linux-arm64-cuda-sm_121.tar.gz` |
 
 Multi-GB assets are split into `.partNN-of-MM.tar.gz` + a `.partcount`
 manifest (GitHub's 2 GiB per-asset limit), the format Lemonade's
