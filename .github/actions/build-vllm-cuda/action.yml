@@ -80,11 +80,22 @@ runs:
         chmod +x "$VLLM_ROOT/bin/vllm-server"
         bash -n "$VLLM_ROOT/bin/vllm-server"
 
-    - name: Smoke test (--help)
+    - name: Smoke test (import)
       shell: bash
       run: |
         set -euo pipefail
-        "$VLLM_ROOT/bin/vllm-server" --help >/dev/null
+        # Can't run `vllm-server --help`: `python -m ...api_server` sets
+        # __name__ == "__main__", which executes api_server.py's
+        # `if __name__ == "__main__":` block unconditionally (before
+        # argparse even looks at --help). That block builds the full CLI
+        # parser, which instantiates a default DeviceConfig() that
+        # auto-detects the accelerator -- and fails hard with "Failed to
+        # infer device type" on a GPU-less CI runner, since this is the
+        # CUDA-targeted wheel (not the CPU-build vLLM needs for its CPU
+        # fallback). A plain import only exercises import-time code
+        # (verifies torch/vllm/CUDA shared libs all load) without needing
+        # a live GPU.
+        "$VLLM_ROOT/bin/python3" -c "import vllm.entrypoints.openai.api_server"
 
     - name: Package asset (tar.gz, split if over GitHub's 2 GiB limit)
       shell: bash
