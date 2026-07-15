@@ -1,0 +1,228 @@
+name: build-release
+
+# Builds self-contained, per-architecture vllm-server bundles consumed by
+# Lemonade's `vllm` backend (cuda device). No vLLM code is forked: at build
+# time the official `vllm` PyPI wheel is installed (which pulls in the
+# official CUDA-enabled `torch`/`torchvision`/`torchaudio` wheels as normal
+# dependencies -- no AMD-style extra index needed), a thin `bin/vllm-server`
+# launcher shim is added, and the fat multi-architecture binaries are pruned
+# down to one target GPU architecture with NVIDIA's own `nvprune` (see
+# scripts/prune_cuda_arch.sh and the README's target-matrix table for why
+# sm_89/sm_121 currently reuse their neighbor's PTX).
+#
+# One asset is published per architecture -- names match
+# VLLMServer::get_install_params() in lemonade:
+#   vllm-server-<tag>-linux-x64-cuda-<sm_target>.tar.gz
+#
+# STATUS: prototype. Not yet validated end-to-end on real NVIDIA hardware.
+#
+# TODO(windows-cuda): add a windows-x64 matrix leg once a Windows nvprune/
+# cuobjdump install path (choco/direct .exe download, no apt) is worked out.
+
+on:
+  schedule:
+    - cron: '47 6 * * *'   # daily -- poll PyPI for new vllm releases
+  workflow_dispatch:
+    inputs:
+      vllm_version:
+        description: 'vllm version (empty = latest on PyPI)'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if the release already exists'
+        type: boolean
+        default: false
+      sm_targets:
+        description: 'Comma-separated sm_XX targets to build (empty = all)'
+        required: false
+        default: ''
+      cuda_toolkit_version:
+        description: 'CUDA toolkit package version suffix for nvprune/cuobjdump (e.g. 12-8)'
+        required: false
+        default: '12-8'
+
+permissions:
+  contents: write
+
+env:
+  # torch's fat wheel (verified against 2.11.0+cu128) ships native cubins for
+  # these, plus compute_120 PTX. sm_89/sm_121 have no native cubin yet, so
+  # they're pruned from the nearest same-generation PTX instead (JIT at
+  # first launch) -- see README's target matrix for the full rationale.
+  DEFAULT_SM_TARGETS: "sm_75,sm_80,sm_86,sm_89,sm_90,sm_100,sm_120,sm_121"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      need_build: ${{ steps.resolve.outputs.need_build }}
+      sm_targets: ${{ steps.resolve.outputs.sm_targets }}
+    steps:
+      - name: Resolve version, tag, and target matrix
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.event.inputs.vllm_version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(curl -fsSL https://pypi.org/pypi/vllm/json | jq -r '.info.version')
+          fi
+          TAG="vllm${VERSION}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+
+          NEED=true
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if [ "${{ github.event.inputs.force }}" != "true" ]; then
+              NEED=false
+            fi
+          fi
+          echo "need_build=$NEED" >> "$GITHUB_OUTPUT"
+
+          TARGETS="${{ github.event.inputs.sm_targets }}"
+          [ -n "$TARGETS" ] || TARGETS="$DEFAULT_SM_TARGETS"
+          # Emit as a JSON array for the build job's matrix.
+          JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1].split(',')))" "$TARGETS")
+          echo "sm_targets=$JSON" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved vllm $VERSION -> tag $TAG (need_build=$NEED, targets=$TARGETS)"
+
+  build:
+    needs: check
+    if: needs.check.outputs.need_build == 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sm_target: ${{ fromJson(needs.check.outputs.sm_targets) }}
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+      SM_TARGET: ${{ matrix.sm_target }}
+      CUDA_TOOLKIT_VERSION: ${{ github.event.inputs.cuda_toolkit_version || '12-8' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nvprune + cuobjdump (standalone apt packages, not the full CUDA Toolkit)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            "cuda-nvprune-${CUDA_TOOLKIT_VERSION}" \
+            "cuda-cuobjdump-${CUDA_TOOLKIT_VERSION}"
+          echo "/usr/local/cuda-${CUDA_TOOLKIT_VERSION//-/.}/bin" >> "$GITHUB_PATH"
+
+      - name: Download portable Python (python-build-standalone)
+        run: |
+          set -euo pipefail
+          # vllm's official wheel is cp38-abi3 (works with any CPython >= 3.8),
+          # so there's no channel-driven Python version split like vllm-rocm
+          # needs -- pick one modern relocatable interpreter.
+          PBS_TAG=20260623
+          PBS_PY=3.12.9
+          PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-${PBS_PY}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
+          ROOT="$RUNNER_TEMP/vllm-build/vllm"
+          mkdir -p "$RUNNER_TEMP/vllm-build"
+          curl -fsSL "$PBS_URL" | tar -xz -C "$RUNNER_TEMP/vllm-build"
+          mv "$RUNNER_TEMP/vllm-build/python" "$ROOT"
+          "$ROOT/bin/python3" --version
+          echo "VLLM_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Install vLLM + PyTorch from official PyPI (fat, all architectures)
+        run: |
+          set -euo pipefail
+          "$VLLM_ROOT/bin/python3" -m pip install --upgrade pip
+          # Plain PyPI install -- no --index-url/--extra-index-url override.
+          # PyPI's default linux wheel for torch is already CUDA-enabled and
+          # is what vllm's own dependency metadata pins, so this is the
+          # simplest correct install (see README).
+          "$VLLM_ROOT/bin/pip" install "vllm==${VERSION}"
+          "$VLLM_ROOT/bin/python3" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+      - name: Determine PTX fallback for this target (sm_89 -> sm_86, sm_121 -> sm_120)
+        id: fallback
+        run: |
+          set -euo pipefail
+          case "$SM_TARGET" in
+            sm_89)  echo "ptx_fallback=sm_86"  >> "$GITHUB_OUTPUT" ;;
+            sm_121) echo "ptx_fallback=sm_120" >> "$GITHUB_OUTPUT" ;;
+            *)      echo "ptx_fallback="        >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Prune fat binaries down to ${{ matrix.sm_target }}
+        run: |
+          set -euo pipefail
+          SITE_PACKAGES="$VLLM_ROOT/lib/python3.12/site-packages"
+          chmod +x scripts/prune_cuda_arch.sh
+          ./scripts/prune_cuda_arch.sh "$SITE_PACKAGES" "$SM_TARGET" "${{ steps.fallback.outputs.ptx_fallback }}"
+
+      - name: Add vllm-server launcher shim
+        run: |
+          set -euo pipefail
+          cat > "$VLLM_ROOT/bin/vllm-server" << 'LAUNCHER_EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
+          LAUNCHER_EOF
+          chmod +x "$VLLM_ROOT/bin/vllm-server"
+          bash -n "$VLLM_ROOT/bin/vllm-server"
+
+      - name: Smoke test (--help)
+        run: |
+          set -euo pipefail
+          "$VLLM_ROOT/bin/vllm-server" --help >/dev/null
+
+      - name: Package asset (tar.gz, split if over GitHub's 2 GiB limit)
+        run: |
+          set -euo pipefail
+          BASE="vllm-server-${TAG}-linux-x64-cuda-${SM_TARGET}"
+          TARBALL="${BASE}.tar.gz"
+          tar -czf "${TARBALL}" -C "$(dirname "$VLLM_ROOT")" "$(basename "$VLLM_ROOT")"
+
+          LIMIT=$((1900 * 1024 * 1024))   # 1900 MiB, comfortably under 2 GiB
+          SIZE=$(wc -c < "${TARBALL}")
+          : > uploads.txt
+          if [ "${SIZE}" -gt "${LIMIT}" ]; then
+            split -b "${LIMIT}" -d -a 2 "${TARBALL}" "${BASE}.rawpart"
+            mapfile -t PARTS < <(ls "${BASE}".rawpart* | sort)
+            N=${#PARTS[@]}
+            NN=$(printf '%02d' "${N}")
+            i=1
+            for p in "${PARTS[@]}"; do
+              II=$(printf '%02d' "${i}")
+              mv "${p}" "${BASE}.part${II}-of-${NN}.tar.gz"
+              echo "${BASE}.part${II}-of-${NN}.tar.gz" >> uploads.txt
+              i=$((i + 1))
+            done
+            printf '%s\n' "${N}" > "${BASE}.partcount"
+            echo "${BASE}.partcount" >> uploads.txt
+            rm -f "${TARBALL}"
+            echo "Split ${TARBALL} (${SIZE} bytes) into ${N} parts"
+          else
+            echo "${TARBALL}" >> uploads.txt
+            echo "Single asset ${TARBALL} (${SIZE} bytes)"
+          fi
+          cat uploads.txt
+
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "vllm-server $TAG" \
+              --notes "Self-contained vllm-server bundles (vllm ${VERSION}) for Lemonade's vllm CUDA backend, pruned per NVIDIA architecture with nvprune. Multi-GB bundles are split into .partNN-of-MM.tar.gz + .partcount." \
+              || true
+          fi
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber
+          done < uploads.txt
