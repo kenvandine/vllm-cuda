@@ -1,36 +1,40 @@
 name: build-release
 
-# Builds self-contained, per-architecture vllm-server bundles consumed by
-# Lemonade's `vllm` backend (cuda device). No vLLM code is forked: at build
-# time the official `vllm` PyPI wheel is installed (which pulls in the
-# official CUDA-enabled `torch`/`torchvision`/`torchaudio` wheels as normal
-# dependencies -- no AMD-style extra index needed), a thin `bin/vllm-server`
-# launcher shim is added, and the fat multi-architecture binaries are pruned
-# down to one target GPU architecture with NVIDIA's own `nvprune` (see
-# scripts/prune_cuda_arch.sh and the README's target-matrix table for why
-# sm_89/sm_121 currently reuse their neighbor's PTX).
+# Builds self-contained vllm-server bundles consumed by Lemonade's `vllm`
+# backend (cuda device). No vLLM code is forked: at build time the official
+# `vllm` PyPI wheel is installed (which pulls in the official CUDA-enabled
+# `torch`/`torchvision`/`torchaudio` wheels as normal dependencies -- no
+# AMD-style extra index needed) and a thin `bin/vllm-server` launcher shim is
+# added. See the README for the full rationale.
 #
-# One asset is published per architecture -- names match
-# VLLMServer::get_install_params() in lemonade:
-#   vllm-server-<tag>-linux-x64-cuda-<sm_target>.tar.gz
-#   vllm-server-<tag>-linux-arm64-cuda-<sm_target>.tar.gz
+# One asset is published per HOST ARCHITECTURE (not per GPU generation):
+#   vllm-server-<tag>-linux-x64.tar.gz
+#   vllm-server-<tag>-linux-arm64.tar.gz
 #
-# sm_121 (NVIDIA GB10 / Jetson Thor) is ARM64-only: those are Grace-CPU-paired
-# SoC/superchip modules, not discrete GPUs that plug into an x86_64 host, so
-# there is no linux-x64-cuda-sm_121 asset -- it's built by build-arm64 on a
-# GitHub-hosted ARM64 runner against the aarch64 vllm/torch wheels (confirmed
-# on PyPI/download.pytorch.org: torch ships manylinux_2_28_aarch64 cu128
-# wheels with native sm_80/90/100/120 cubins + compute_120 PTX, same
-# PTX-fallback situation for sm_121 as the x86_64 build has -- see README).
-# sm_90/sm_100 (Hopper/Blackwell DC) are ALSO built on arm64 (NVIDIA
-# GH200/GB200 "Grace Hopper"/"Grace Blackwell" superchips are ARM64-hosted
-# too) in addition to their existing x86_64 assets -- both host archs get a
-# native cubin for those two, unlike sm_121.
+# Each asset ships the wheel exactly as PyPI publishes it -- every native
+# cubin torch/vllm embed for that host arch (sm_75/80/86/90/100/120 on
+# x86_64; sm_80/90/100/120 on arm64), plus PTX for forward compatibility with
+# newer GPUs (e.g. sm_89/sm_121, which have no native cubin in either wheel
+# as of torch 2.11.0 and fall back to same-generation PTX, JIT-compiled on
+# first launch and cached afterward).
+#
+# Earlier prototypes of this repo tried to mirror llama.cpp's per-GPU-arch
+# build matrix by pruning the fat wheel down to one target architecture with
+# NVIDIA's nvprune. That does not work: nvprune requires an unlinked
+# relocatable object (ET_REL, produced with `-rdc=true` before final linking)
+# and refuses ("not relocatable") on the fully-linked shared libraries
+# (ET_DYN) that PyPI wheels actually ship -- confirmed by reproducing the
+# failure locally against a real torch wheel, not just a CI failure. A true
+# per-arch build would mean compiling PyTorch and vLLM's CUDA kernels from
+# source ourselves (unlike vllm-rocm, which repackages AMD's own prebuilt
+# wheels and validates them on a real self-hosted GPU runner) -- multi-hour
+# builds per target with no NVIDIA hardware in this org's CI to validate
+# against. Given that cost/risk, this repo ships the unmodified fat wheel
+# per host platform instead.
 #
 # STATUS: prototype. Not yet validated end-to-end on real NVIDIA hardware.
 #
-# TODO(windows-cuda): add a windows-x64 matrix leg once a Windows nvprune/
-# cuobjdump install path (choco/direct .exe download, no apt) is worked out.
+# TODO(windows-cuda): add a windows-x64 matrix leg.
 
 on:
   schedule:
@@ -45,35 +49,9 @@ on:
         description: 'Rebuild even if the release already exists'
         type: boolean
         default: false
-      sm_targets:
-        description: 'Comma-separated linux-x64 sm_XX targets to build (empty = all)'
-        required: false
-        default: ''
-      sm_targets_arm64:
-        description: 'Comma-separated linux-arm64 sm_XX targets to build (empty = all)'
-        required: false
-        default: ''
-      cuda_toolkit_version:
-        description: 'CUDA toolkit package version suffix for nvprune/cuobjdump (e.g. 12-8)'
-        required: false
-        default: '12-8'
 
 permissions:
   contents: write
-
-env:
-  # torch's x86_64 fat wheel (verified against 2.11.0+cu128) ships native
-  # cubins for these, plus compute_120 PTX. sm_89 has no native cubin yet, so
-  # it's pruned from sm_86's PTX instead (JIT at first launch) -- see
-  # README's target matrix for the full rationale. sm_121 is ARM64-only (see
-  # header comment) so it is NOT in this list.
-  DEFAULT_SM_TARGETS: "sm_75,sm_80,sm_86,sm_89,sm_90,sm_100,sm_120"
-  # torch's aarch64 fat wheel (verified against 2.11.0+cu128) ships native
-  # cubins for sm_80/90/100/120, no native sm_121 cubin -- pruned from
-  # sm_120's PTX instead, same JIT-fallback situation as sm_89 above.
-  # sm_90/sm_100 get a native-cubin arm64 build too (GH200/GB200), alongside
-  # their existing x86_64 assets.
-  DEFAULT_SM_TARGETS_ARM64: "sm_90,sm_100,sm_121"
 
 jobs:
   check:
@@ -82,10 +60,8 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
       need_build: ${{ steps.resolve.outputs.need_build }}
-      sm_targets: ${{ steps.resolve.outputs.sm_targets }}
-      sm_targets_arm64: ${{ steps.resolve.outputs.sm_targets_arm64 }}
     steps:
-      - name: Resolve version, tag, and target matrix
+      - name: Resolve version and tag
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
@@ -107,34 +83,18 @@ jobs:
           fi
           echo "need_build=$NEED" >> "$GITHUB_OUTPUT"
 
-          TARGETS="${{ github.event.inputs.sm_targets }}"
-          [ -n "$TARGETS" ] || TARGETS="$DEFAULT_SM_TARGETS"
-          JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1].split(',')))" "$TARGETS")
-          echo "sm_targets=$JSON" >> "$GITHUB_OUTPUT"
+          echo "Resolved vllm $VERSION -> tag $TAG (need_build=$NEED)"
 
-          TARGETS_ARM64="${{ github.event.inputs.sm_targets_arm64 }}"
-          [ -n "$TARGETS_ARM64" ] || TARGETS_ARM64="$DEFAULT_SM_TARGETS_ARM64"
-          JSON_ARM64=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1].split(',')))" "$TARGETS_ARM64")
-          echo "sm_targets_arm64=$JSON_ARM64" >> "$GITHUB_OUTPUT"
-
-          echo "Resolved vllm $VERSION -> tag $TAG (need_build=$NEED, x64 targets=$TARGETS, arm64 targets=$TARGETS_ARM64)"
-
-  # x86_64 targets: discrete NVIDIA GPUs in a standard PC/server.
+  # Discrete NVIDIA GPUs in a standard x86_64 PC/server (Turing through
+  # Blackwell). No per-arch split -- see header comment.
   build-x64:
     needs: check
-    if: needs.check.outputs.need_build == 'true' && fromJson(needs.check.outputs.sm_targets)[0] != ''
+    if: needs.check.outputs.need_build == 'true'
     runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        sm_target: ${{ fromJson(needs.check.outputs.sm_targets) }}
     env:
       VERSION: ${{ needs.check.outputs.version }}
       TAG: ${{ needs.check.outputs.tag }}
-      SM_TARGET: ${{ matrix.sm_target }}
-      CUDA_TOOLKIT_VERSION: ${{ github.event.inputs.cuda_toolkit_version || '12-8' }}
       ASSET_PLATFORM: linux-x64
-      NVIDIA_APT_ARCH: x86_64
       PBS_TRIPLE: x86_64-unknown-linux-gnu
       PBS_PY: 3.12.13
     steps:
@@ -143,35 +103,20 @@ jobs:
         with:
           version: ${{ env.VERSION }}
           tag: ${{ env.TAG }}
-          sm_target: ${{ env.SM_TARGET }}
           asset_platform: ${{ env.ASSET_PLATFORM }}
-          nvidia_apt_arch: ${{ env.NVIDIA_APT_ARCH }}
           pbs_triple: ${{ env.PBS_TRIPLE }}
           pbs_py: ${{ env.PBS_PY }}
-          cuda_toolkit_version: ${{ env.CUDA_TOOLKIT_VERSION }}
 
-  # ARM64 targets: Grace-CPU-paired NVIDIA SoC/superchip platforms.
-  # sm_121 (GB10 "DGX Spark" / Jetson Thor) has NO x86_64 counterpart, hence a
-  # separate job/runner rather than a matrix leg on build-x64. sm_90/sm_100
-  # (GH200/GB200 "Grace Hopper"/"Grace Blackwell") DO also exist as discrete
-  # x86_64 PCIe cards (H100/H200, B100/B200) and get a build there too --
-  # they're built here as well because the Grace-paired arm64 host is a
-  # distinct deployment target Lemonade may run on directly.
+  # Grace-CPU-paired NVIDIA SoC/superchip platforms (GH200, GB200, GB10/Thor)
+  # -- ARM64 hosts with no x86_64 counterpart for some of them (GB10/Thor).
   build-arm64:
     needs: check
-    if: needs.check.outputs.need_build == 'true' && fromJson(needs.check.outputs.sm_targets_arm64)[0] != ''
+    if: needs.check.outputs.need_build == 'true'
     runs-on: ubuntu-22.04-arm
-    strategy:
-      fail-fast: false
-      matrix:
-        sm_target: ${{ fromJson(needs.check.outputs.sm_targets_arm64) }}
     env:
       VERSION: ${{ needs.check.outputs.version }}
       TAG: ${{ needs.check.outputs.tag }}
-      SM_TARGET: ${{ matrix.sm_target }}
-      CUDA_TOOLKIT_VERSION: ${{ github.event.inputs.cuda_toolkit_version || '12-8' }}
       ASSET_PLATFORM: linux-arm64
-      NVIDIA_APT_ARCH: sbsa
       PBS_TRIPLE: aarch64-unknown-linux-gnu
       PBS_PY: 3.12.13
     steps:
@@ -180,9 +125,6 @@ jobs:
         with:
           version: ${{ env.VERSION }}
           tag: ${{ env.TAG }}
-          sm_target: ${{ env.SM_TARGET }}
           asset_platform: ${{ env.ASSET_PLATFORM }}
-          nvidia_apt_arch: ${{ env.NVIDIA_APT_ARCH }}
           pbs_triple: ${{ env.PBS_TRIPLE }}
           pbs_py: ${{ env.PBS_PY }}
-          cuda_toolkit_version: ${{ env.CUDA_TOOLKIT_VERSION }}

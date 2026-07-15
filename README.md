@@ -1,129 +1,97 @@
 # vllm-cuda
 
-<a href="https://github.com/lemonade-sdk/vllm-cuda/releases/latest" title="Download the latest release">
-  <img src="https://img.shields.io/github/v/release/lemonade-sdk/vllm-cuda?logo=github&logoColor=white" alt="GitHub release (latest by date)" />
-</a>
-<a href="https://github.com/lemonade-sdk/vllm-cuda/releases/latest" title="View latest release date">
-  <img src="https://img.shields.io/github/release-date/lemonade-sdk/vllm-cuda?logo=github&logoColor=white" alt="Latest release date" />
-</a>
-<a href="LICENSE" title="View license">
-  <img src="https://img.shields.io/github/license/lemonade-sdk/vllm-cuda?logo=opensourceinitiative&logoColor=white" alt="License" />
-</a>
-<a href="https://developer.nvidia.com/cuda-toolkit" title="Powered by CUDA">
-  <img src="https://img.shields.io/badge/NVIDIA-CUDA-76B900?logo=nvidia&logoColor=white" alt="NVIDIA CUDA" />
-</a>
-<a href="https://github.com/vllm-project/vllm" title="Powered by vLLM">
-  <img src="https://img.shields.io/badge/Powered%20by-vLLM-blue" alt="Powered by vLLM" />
-</a>
+Prototype build/distribution repo holding self-contained `vllm-server`
+bundles for Lemonade's `vllm` backend on NVIDIA CUDA. Like
+[`vllm-rocm`](https://github.com/lemonade-sdk/vllm-rocm) and
+[`chatterbox-rocm`](https://github.com/lemonade-sdk/chatterbox-rocm), this
+repo holds only build artifacts (via GitHub Releases) and CI to produce
+them -- no vLLM source is forked or vendored here.
 
-Distribution repository for self-contained, per-architecture **vLLM + CUDA**
-bundles consumed by [Lemonade](https://github.com/lemonade-sdk/lemonade)'s
-`vllm` backend (`cuda` device).
+## Why this repo exists
 
-**No vLLM code is forked or vendored here.** Unlike AMD ROCm — which has no
-official PyPI wheels and needs a from-scratch build against AMD's private
-wheel indices (see the sibling
-[`vllm-rocm`](https://github.com/lemonade-sdk/vllm-rocm) repo) — NVIDIA CUDA
-is upstream vLLM's primary supported platform: `vllm`'s official PyPI wheel
-pulls in PyTorch's official CUDA wheel as a normal dependency, and PyTorch's
-CUDA wheels bundle the CUDA runtime themselves (via `nvidia-*-cu12`
-packages). So this repo's job is narrower than `vllm-rocm`'s: **shrink**
-upstream's already-working fat binaries into per-architecture downloads,
-rather than **producing** a working ROCm build from scratch.
+Lemonade's `vllm` backend currently only ships a ROCm build
+(`lemonade-sdk/vllm-rocm`), gated to specific AMD GPU families. NVIDIA CUDA
+is upstream vLLM's primary supported platform: `pip install vllm` pulls in
+the official CUDA-enabled PyTorch wheels as an ordinary dependency, no
+special package index required (unlike ROCm, where AMD publishes its own
+private wheel index because there's no official upstream CUDA-equivalent
+path). This repo automates that install into a portable, self-contained
+bundle Lemonade can download and run, the same shape as the other backend
+asset repos.
 
-> **Status: prototype.** This repo currently holds a build/release pipeline
-> only. The `nvprune` pruning step below has not yet been validated against a
-> real `vllm` release output or on real NVIDIA hardware, and Lemonade does not
-> yet consume its releases (that wiring is tracked separately in
-> `lemonade-sdk/lemonade`).
+## Why there's no per-GPU-architecture build matrix
 
-## Why per-architecture builds are needed at all
+llama.cpp ships a separate binary per GPU architecture (`sm_75`, `sm_86`,
+`sm_120`, ...) because it's compiled from source for each target. We
+initially tried to mirror that here by installing the official (fat,
+multi-architecture) `vllm`/`torch` wheels and then pruning them down to one
+target GPU architecture with NVIDIA's `nvprune` tool.
 
-A single official PyTorch CUDA wheel is a **fat binary**: it embeds native
-cubins for several compute capabilities plus PTX for the newest one (verified
-by inspecting `torch-2.11.0+cu128`'s `libtorch_cuda.so`, which contains
-`sm_75, sm_80, sm_86, sm_90, sm_100, sm_120` cubins and `compute_120` PTX).
-That's already broader coverage than ROCm gets from one build — no
-from-scratch per-arch compile is required — but the fat binary itself is
-large (900MB+ for `libtorch_cuda.so` alone) because it carries every
-architecture's machine code at once, and vLLM ships several of its own CUDA
-extension `.so` files on top of torch's.
+**That doesn't work.** `nvprune` operates on unlinked relocatable objects
+(ELF type `ET_REL`, produced with `nvcc -rdc=true` before final linking) --
+not on already-linked shared libraries (`ET_DYN`), which is exactly what
+`pip install torch`/`vllm` gives you. Every `.so` in the official wheels that
+actually embeds device code (`libtorch_cuda.so`, vLLM's custom CUDA
+extensions, etc.) fails pruning with `nvprune fatal: Input file '...' not
+relocatable`. This was confirmed two ways: it failed in real CI (every
+target, 0/38 device-code-bearing libraries pruned), and reproduced locally
+by downloading a real `torch+cu128` wheel and running `nvprune` against
+`libtorch_cuda.so` directly -- same error, independent of CI environment.
 
-To mirror llama.cpp's per-`sm_XX` download-size discipline, this repo
-**prunes** the fat wheel down to one architecture per release asset using
-NVIDIA's own `nvprune` tool (confirmed available as standalone apt packages
-`cuda-nvprune-12-8` / `cuda-cuobjdump-12-8` — no full CUDA Toolkit install
-needed) instead of recompiling anything:
+A true per-architecture build would mean compiling PyTorch and vLLM's custom
+CUDA kernels from source ourselves. That's a materially different (and much
+more expensive) undertaking than what `vllm-rocm` does: `vllm-rocm` doesn't
+build from source either -- it downloads AMD's own prebuilt nightly wheel
+and validates it on a real self-hosted AMD GPU runner
+(`dev_lab`/`ta-devlab-halo-03`). NVIDIA/PyPI has no equivalent "prebuilt
+per-arch wheel" to repackage, and there's currently no self-hosted NVIDIA GPU
+runner in this org's CI to validate a from-source build against. Given that
+cost and risk, this repo instead ships the **unmodified, fat, official
+wheel** for each host platform:
 
-1. Install the official `vllm` + `torch` wheels once (fat, all archs).
-2. Run `nvprune` over every `.so` under `site-packages` that embeds
-   device code, keeping only the target arch's cubin (and its PTX, for
-   forward-compat within the same major generation).
-3. Package the pruned tree per architecture.
+| Host platform | Asset | Native cubins embedded | PTX fallback |
+|---|---|---|---|
+| linux-x64 | `linux-x64` | `sm_75, sm_80, sm_86, sm_90, sm_100, sm_120` | `compute_120` (covers `sm_89`/Ada and any newer arch) |
+| linux-arm64 | `linux-arm64` | `sm_80, sm_90, sm_100, sm_120` | `compute_120` (covers `sm_121`/GB10/Thor and any newer arch) |
 
-### Target matrix (mirrors `llamacpp`'s CUDA support list in Lemonade)
+(Verified directly against `torch-2.11.0+cu128` with `cuobjdump`.)
 
-Verified directly against the actual PyPI/PyTorch wheels (downloaded and
-inspected with `cuobjdump`/`strings`), separately for each host architecture
-— they don't ship the same native cubins:
+Architectures without a native cubin (`sm_89` Ada on x86_64, `sm_121`
+GB10/Jetson Thor on arm64) still run correctly -- the NVIDIA driver JIT-compiles
+the nearest same-generation PTX on first launch and caches the result, at the
+cost of a one-time startup delay. This mirrors how every ordinary
+`pip install vllm` deployment on those GPUs already behaves; Lemonade gets
+no worse (and no better) compile-time behavior than a manual install would.
 
-| Target | Host arch | Cubin source | Notes |
-|--------|-----------|-------------|-------|
-| `sm_75` (Turing) | x86_64 | native | RTX 20, GTX 16, T4 |
-| `sm_80` (Ampere DC) | x86_64 | native | A100 |
-| `sm_86` (Ampere) | x86_64 | native | RTX 30, A40, A6000 |
-| `sm_89` (Ada) | x86_64 | PTX JIT from `compute_86` | torch's x86_64 fat wheel has no native `sm_89` cubin; forward-compat PTX JIT applies (same major generation as `sm_86`). First launch pays a JIT-compile cost that vLLM/torch then cache. |
-| `sm_90` (Hopper) | x86_64 **and** arm64 | native | H100, H200 (x86_64); GH200 "Grace Hopper" (arm64) |
-| `sm_100` (Blackwell DC) | x86_64 **and** arm64 | native | B100, B200 (x86_64); GB200 "Grace Blackwell" (arm64) |
-| `sm_120` (Blackwell) | x86_64 | native | RTX 50 |
-| `sm_121` (GB10/Thor) | **arm64 only** | PTX JIT from `compute_120` | GB10 ("DGX Spark") and Jetson Thor are Grace-CPU-paired SoC/superchip modules — ARM64 hosts, not discrete GPUs in an x86_64 PC. Built by a separate `build-arm64` job on a GitHub-hosted ARM64 runner (`ubuntu-22.04-arm`), against the `manylinux_2_28_aarch64` vllm/torch wheels. Verified torch's aarch64 fat wheel embeds native `sm_80/90/100/120` cubins (a different, narrower set than the x86_64 wheel) but **no native `sm_121` cubin**, so it falls back to `compute_120` PTX, same JIT-on-first-launch situation as `sm_89` above. |
+linux-arm64 covers NVIDIA's Grace-CPU-paired SoC/superchip platforms
+(GH200 "Grace Hopper", GB200 "Grace Blackwell", GB10 "DGX Spark" /
+Jetson Thor) -- ARM64 hosts, not discrete GPUs plugged into an x86_64 PC.
+GB10/Thor (`sm_121`) has no x86_64 counterpart at all; GH200/GB200
+(`sm_90`/`sm_100`) also exist as discrete x86_64 PCIe cards (H100/H200,
+B100/B200), which is why those two architectures' native cubins appear in
+*both* rows above.
 
-`sm_89` is therefore identical in content to `sm_86`'s pruned build, and
-`sm_121` is identical to `sm_120`'s (arm64) pruned build — they exist as
-separate release tags/filenames purely so Lemonade's `get_install_params()`
-can key off `SystemInfo::get_cuda_arch()` uniformly, matching the llama.cpp
-CUDA convention. This can be revisited once torch ships native cubins for
-those architectures.
-
-`sm_90`/`sm_100` are built on **both** host architectures: x86_64 (for
-discrete H100/H200/B100/B200 PCIe cards) and arm64 (for GH200/GB200
-Grace-paired superchips), each with its own native cubin from that host's
-fat wheel. The `build-arm64` job runs all three ARM64 targets
-(`sm_90,sm_100,sm_121`) on the same `ubuntu-22.04-arm` runner.
+This can be revisited (either full nvprune-based pruning if NVIDIA ships a
+tool that supports linked libraries, or genuine from-source per-arch builds)
+once there's a concrete size/performance reason and a way to validate
+against real hardware.
 
 ## Releases
 
 The [build workflow](.github/workflows/build-release.yml) polls PyPI daily.
 When a new `vllm` version appears, it builds and publishes a release tagged
-`vllm<version>` (e.g. `vllm0.25.1`) with one asset per target architecture:
+`vllm<version>` (e.g. `vllm0.25.1`) with one asset per host platform:
 
-| Platform | Device | Asset |
-|----------|--------|-------|
-| Linux x64 | CUDA (`sm_75`) | `vllm-server-<tag>-linux-x64-cuda-sm_75.tar.gz` |
-| Linux x64 | CUDA (`sm_80`) | `vllm-server-<tag>-linux-x64-cuda-sm_80.tar.gz` |
-| Linux x64 | CUDA (`sm_86`) | `vllm-server-<tag>-linux-x64-cuda-sm_86.tar.gz` |
-| Linux x64 | CUDA (`sm_89`) | `vllm-server-<tag>-linux-x64-cuda-sm_89.tar.gz` |
-| Linux x64 | CUDA (`sm_90`) | `vllm-server-<tag>-linux-x64-cuda-sm_90.tar.gz` |
-| Linux x64 | CUDA (`sm_100`) | `vllm-server-<tag>-linux-x64-cuda-sm_100.tar.gz` |
-| Linux x64 | CUDA (`sm_120`) | `vllm-server-<tag>-linux-x64-cuda-sm_120.tar.gz` |
-| **Linux arm64** | CUDA (`sm_90`) | `vllm-server-<tag>-linux-arm64-cuda-sm_90.tar.gz` |
-| **Linux arm64** | CUDA (`sm_100`) | `vllm-server-<tag>-linux-arm64-cuda-sm_100.tar.gz` |
-| **Linux arm64** | CUDA (`sm_121`) | `vllm-server-<tag>-linux-arm64-cuda-sm_121.tar.gz` |
+| Platform | Asset |
+|----------|-------|
+| Linux x64 | `vllm-server-<tag>-linux-x64-cuda.tar.gz` |
+| Linux arm64 | `vllm-server-<tag>-linux-arm64-cuda.tar.gz` |
 
 Multi-GB assets are split into `.partNN-of-MM.tar.gz` + a `.partcount`
 manifest (GitHub's 2 GiB per-asset limit), the format Lemonade's
 split-archive installer reassembles.
 
-Windows support is not yet included in this prototype — see the `TODO` in the
-build workflow for what's needed to add `windows-x64-cuda-*` assets.
-
-Lemonade would pin the release tag it consumes in
-[`backend_versions.json`](https://github.com/lemonade-sdk/lemonade/blob/main/src/cpp/resources/backend_versions.json)
-(`vllm.cuda`), analogous to the existing `vllm.rocm` pin, with
-`get_install_params()` mapping `SystemInfo::get_cuda_arch()` to the matching
-asset suffix (the same pattern `llamacpp` already uses for its own CUDA
-builds).
-
-Builds can also be triggered manually from the Actions tab (with an optional
-explicit `vllm` version, a `force` rebuild flag, and a comma-separated
-`sm_targets` override).
+Each bundle is a self-contained, relocatable Python environment
+(`python-build-standalone` + the `vllm`/`torch` wheels installed into it)
+with a `bin/vllm-server` launcher shim that execs
+`python3 -m vllm.entrypoints.openai.api_server`.

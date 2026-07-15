@@ -1,10 +1,10 @@
 name: build-vllm-cuda
 description: >
-  Installs the official vllm/torch wheels for one host architecture, prunes
-  the fat multi-arch binaries down to a single target GPU architecture with
-  nvprune, packages the result, and publishes it as a release asset. Shared
-  by build-x64 and build-arm64 in build-release.yml -- see that file's header
-  comment and the README's target-matrix table for the full rationale.
+  Installs the official vllm/torch wheels (unmodified, fat/multi-arch) for
+  one host architecture, packages the result, and publishes it as a release
+  asset. Shared by build-x64 and build-arm64 in build-release.yml -- see that
+  file's header comment and the README for the full rationale, including why
+  this ships one fat build per platform rather than per-GPU-arch builds.
 
 inputs:
   version:
@@ -13,48 +13,19 @@ inputs:
   tag:
     required: true
     description: release tag (e.g. vllm0.25.1)
-  sm_target:
-    required: true
-    description: target GPU architecture, e.g. sm_86 or sm_121
   asset_platform:
     required: true
     description: asset platform component, e.g. linux-x64 or linux-arm64
-  nvidia_apt_arch:
-    required: true
-    description: NVIDIA apt repo architecture path segment (x86_64 or sbsa)
   pbs_triple:
     required: true
     description: python-build-standalone target triple, e.g. x86_64-unknown-linux-gnu
   pbs_py:
     required: true
     description: python-build-standalone CPython version, e.g. 3.12.13
-  cuda_toolkit_version:
-    required: true
-    description: CUDA toolkit package version suffix for nvprune/cuobjdump, e.g. 12-8
 
 runs:
   using: composite
   steps:
-    - name: Install nvprune + cuobjdump (standalone apt packages, not the full CUDA Toolkit)
-      shell: bash
-      env:
-        NVIDIA_APT_ARCH: ${{ inputs.nvidia_apt_arch }}
-        CUDA_TOOLKIT_VERSION: ${{ inputs.cuda_toolkit_version }}
-      run: |
-        set -euo pipefail
-        # ubuntu2204 + {x86_64,sbsa} are the two host-arch repo paths NVIDIA
-        # publishes standalone CUDA component packages under; sbsa is the
-        # ARM64 server path (used by GH200/GB200/Grace-paired boards, which
-        # is also what GitHub's ubuntu-22.04-arm runner needs here).
-        KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${NVIDIA_APT_ARCH}/cuda-keyring_1.1-1_all.deb"
-        curl -fsSL "$KEYRING_URL" -o /tmp/cuda-keyring.deb
-        sudo dpkg -i /tmp/cuda-keyring.deb
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends \
-          "cuda-nvprune-${CUDA_TOOLKIT_VERSION}" \
-          "cuda-cuobjdump-${CUDA_TOOLKIT_VERSION}"
-        echo "/usr/local/cuda-${CUDA_TOOLKIT_VERSION//-/.}/bin" >> "$GITHUB_PATH"
-
     - name: Download portable Python (python-build-standalone)
       shell: bash
       env:
@@ -73,8 +44,6 @@ runs:
         mv "$RUNNER_TEMP/vllm-build/python" "$ROOT"
         "$ROOT/bin/python3" --version
         echo "VLLM_ROOT=$ROOT" >> "$GITHUB_ENV"
-        # Site-packages path embeds the MAJOR.MINOR of pbs_py (e.g. 3.12).
-        echo "PY_MAJOR_MINOR=$(echo "$PBS_PY" | cut -d. -f1,2)" >> "$GITHUB_ENV"
 
     - name: Install vLLM + PyTorch from official PyPI (fat, all architectures)
       shell: bash
@@ -88,36 +57,15 @@ runs:
         # already CUDA-enabled and is what vllm's own dependency metadata
         # pins, so this is the simplest correct install (see README). pip
         # auto-selects the aarch64 wheel on an ARM64 interpreter.
+        #
+        # This wheel is left exactly as PyPI publishes it: every native cubin
+        # torch/vllm ship for this host arch (sm_75/80/86/90/100/120 on
+        # x86_64; sm_80/90/100/120 on arm64) plus PTX for forward
+        # compatibility with newer GPUs. There is no per-GPU-arch pruning --
+        # see the README for why (nvprune cannot process already-linked
+        # shared libraries, only unlinked relocatable objects).
         "$VLLM_ROOT/bin/pip" install "vllm==${VERSION}"
         "$VLLM_ROOT/bin/python3" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
-
-    - name: Determine PTX fallback for this target
-      id: fallback
-      shell: bash
-      env:
-        SM_TARGET: ${{ inputs.sm_target }}
-      run: |
-        set -euo pipefail
-        # sm_89 (Ada, x86_64) and sm_121 (GB10/Thor, ARM64) have no native
-        # cubin in either fat wheel as of torch 2.11.0 -- fall back to the
-        # PTX of the nearest same-generation architecture that IS natively
-        # compiled (sm_86 and sm_120 respectively). See README target matrix.
-        case "$SM_TARGET" in
-          sm_89)  echo "ptx_fallback=sm_86"  >> "$GITHUB_OUTPUT" ;;
-          sm_121) echo "ptx_fallback=sm_120" >> "$GITHUB_OUTPUT" ;;
-          *)      echo "ptx_fallback="        >> "$GITHUB_OUTPUT" ;;
-        esac
-
-    - name: Prune fat binaries down to target architecture
-      shell: bash
-      env:
-        SM_TARGET: ${{ inputs.sm_target }}
-        PTX_FALLBACK: ${{ steps.fallback.outputs.ptx_fallback }}
-      run: |
-        set -euo pipefail
-        SITE_PACKAGES="$VLLM_ROOT/lib/python${PY_MAJOR_MINOR}/site-packages"
-        chmod +x "$GITHUB_ACTION_PATH/../../../scripts/prune_cuda_arch.sh"
-        "$GITHUB_ACTION_PATH/../../../scripts/prune_cuda_arch.sh" "$SITE_PACKAGES" "$SM_TARGET" "$PTX_FALLBACK"
 
     - name: Add vllm-server launcher shim
       shell: bash
@@ -142,11 +90,10 @@ runs:
       shell: bash
       env:
         TAG: ${{ inputs.tag }}
-        SM_TARGET: ${{ inputs.sm_target }}
         ASSET_PLATFORM: ${{ inputs.asset_platform }}
       run: |
         set -euo pipefail
-        BASE="vllm-server-${TAG}-${ASSET_PLATFORM}-cuda-${SM_TARGET}"
+        BASE="vllm-server-${TAG}-${ASSET_PLATFORM}-cuda"
         TARBALL="${BASE}.tar.gz"
         tar -czf "${TARBALL}" -C "$(dirname "$VLLM_ROOT")" "$(basename "$VLLM_ROOT")"
 
@@ -187,7 +134,7 @@ runs:
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "vllm-server $TAG" \
-            --notes "Self-contained vllm-server bundles (vllm ${VERSION}) for Lemonade's vllm CUDA backend, pruned per NVIDIA architecture with nvprune. Multi-GB bundles are split into .partNN-of-MM.tar.gz + .partcount." \
+            --notes "Self-contained vllm-server bundles (vllm ${VERSION}) for Lemonade's vllm CUDA backend: the unmodified, official PyPI vllm+torch wheels for each host architecture (linux-x64, linux-arm64), each supporting every GPU generation that wheel natively targets. Multi-GB bundles are split into .partNN-of-MM.tar.gz + .partcount." \
             || true
         fi
         while IFS= read -r f; do
